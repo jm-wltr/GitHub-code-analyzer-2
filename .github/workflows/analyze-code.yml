@@ -1,0 +1,145 @@
+name: Update Lines of Code in Readme
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"     # Runs weekly on Sunday at midnight (UTC)
+  workflow_dispatch:       # Allows manual trigger
+
+jobs:
+  count-lines:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq cloc locales
+          sudo locale-gen en_US.UTF-8
+
+      - name: Fetch and Clone Repositories
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          # Fetch your public, non-fork repos
+          REPOS=$(curl -H "Authorization: token $GH_PAT" \
+            -s "https://api.github.com/user/repos?per_page=100" \
+            | jq -r '.[] | select(.fork == false) | .full_name') \
+            || echo "Error fetching repositories"
+
+          # Prepare directories
+          mkdir -p public-repos output
+          cd public-repos
+
+          # Clone each default branch and run per-repo cloc
+          for REPO in $REPOS; do
+            AUTH_URL="https://${GH_PAT}@github.com/$REPO.git"
+            DEFAULT_BRANCH=$(curl -H "Authorization: token $GH_PAT" \
+              -s "https://api.github.com/repos/$REPO" \
+              | jq -r '.default_branch')
+            CLONE_DIR="$(basename $REPO)-$DEFAULT_BRANCH"
+            git clone --branch "$DEFAULT_BRANCH" --single-branch \
+              "$AUTH_URL" "$CLONE_DIR" || echo "Failed to clone $REPO"
+
+            # Dump lines count for this repo
+            cloc "$CLONE_DIR" \
+              --exclude-ext=json,html,css,svg,md,py,ps1,scss \
+              --json > "../output/cloc-${REPO//\//_}.json"
+          done
+
+          # Calculate global totals
+          echo "Calculating global lines of code..."
+          cloc . \
+            --exclude-ext=json,html,css,svg,md,py,ps1,scss \
+            --json > ../output/cloc-output.json
+
+      - name: Commit and Push Output
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # --- Build per-repo summary JSON ---
+          echo "[" > output/repos-summary.json
+          first=true
+          for F in output/cloc-*.json; do
+            CNT=$(jq '.SUM.code' "$F")
+            REPO=$(basename "$F" .json | sed 's/^cloc-//; s/_/\//')
+            if $first; then first=false; else echo "," >> output/repos-summary.json; fi
+            printf '{"repo":"%s","code":%s}\n' "$REPO" "$CNT" >> output/repos-summary.json
+          done
+          echo "]" >> output/repos-summary.json
+
+          # --- Generate Markdown list for per-repo breakdown ---
+          format_number() { export LC_ALL="en_US.UTF-8"; printf "%'d" "$1"; }
+          REPO_MD=""
+          while read -r ROW; do
+            R=$(jq -r '.repo' <<<"$ROW")
+            C=$(jq -r '.code' <<<"$ROW")
+            FMT=$(format_number "$C")
+            REPO_MD+="\n- **$R**: $FMT lines"
+          done < <(jq -c '.[]' output/repos-summary.json)
+
+          # Inject per-repo section into README
+          echo -e "```md\n[ REPOSITORY BREAKDOWN ]$REPO_MD\n```" > temp_repo.md
+          sed -i '/<!-- REPOSITORY BREAKDOWN START -->/,/<!-- REPOSITORY BREAKDOWN END -->/{
+              //!d
+              /<!-- REPOSITORY BREAKDOWN START -->/r temp_repo.md
+          }' README.md
+          rm temp_repo.md
+
+          # --- Extract global stats ---
+          TOTAL=$(jq '.SUM.code // 0' output/cloc-output.json)
+          JS=$(jq '.JavaScript.code     // 0' output/cloc-output.json)
+          TS=$(jq '.TypeScript.code     // 0' output/cloc-output.json)
+          JSX=$(jq '.JSX.code           // 0' output/cloc-output.json)
+          CSHARP=$(jq '."C#".code        // 0' output/cloc-output.json)
+          VUE=$(jq '."Vuejs Component".code // 0' output/cloc-output.json)
+          PHP=$(jq '.PHP.code           // 0' output/cloc-output.json)
+          OTHER=$((TOTAL - JS - TS - JSX - PHP - CSHARP - VUE))
+
+          format_number() { export LC_ALL="en_US.UTF-8"; printf "%'d\n" "$1"; }
+
+          F_TOTAL=$(format_number $TOTAL)
+          F_JS=$(format_number $JS)
+          F_TS=$(format_number $TS)
+          F_JSX=$(format_number $JSX)
+          F_CSHARP=$(format_number $CSHARP)
+          F_VUE=$(format_number $VUE)
+          F_PHP=$(format_number $PHP)
+          F_OTHER=$(format_number $OTHER)
+
+          # --- Build global languages block ---
+          CODE_BLOCK="\`\`\`
+          [ LANGUAGES BREAKDOWN ]
+
+          JavaScript   --> $F_JS lines
+          TypeScript   --> $F_TS lines
+          JSX          --> $F_JSX lines
+          Vue.js       --> $F_VUE lines
+          PHP          --> $F_PHP lines
+          C#           --> $F_CSHARP lines
+          Other        --> $F_OTHER lines
+
+          [ TOTAL LINES OF CODE: $F_TOTAL ]
+          \`\`\`"
+
+          # Inject global block into README
+          echo "$CODE_BLOCK" > temp_block.txt
+          sed -i '/<!-- LANGUAGES BREAKDOWN START -->/,/<!-- LANGUAGES BREAKDOWN END -->/{
+              //!d
+              /<!-- LANGUAGES BREAKDOWN START -->/r temp_block.txt
+          }' README.md
+          rm temp_block.txt
+
+          # Commit & push all JSONs and the updated README
+          git add output/*.json README.md
+          git commit -m "chore: update README with global & per-repo code stats" || echo "No changes to commit"
+          git pull --rebase origin main || true
+          git push origin HEAD
