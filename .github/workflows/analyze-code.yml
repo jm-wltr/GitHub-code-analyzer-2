@@ -13,8 +13,8 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0
-          persist-credentials: true
+          fetch-depth: 0            # fetch full history so pushes can fast-forward
+          persist-credentials: true # preserve token for push
 
       - name: Install Dependencies
         run: |
@@ -26,27 +26,27 @@ jobs:
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          # Fetch your public, non-fork repos
+          # Prepare directories
+          mkdir -p public-repos output
+          cd public-repos
+
+          # Fetch list of your public non-fork repos
           REPOS=$(curl -H "Authorization: token $GH_PAT" \
             -s "https://api.github.com/user/repos?per_page=100" \
             | jq -r '.[] | select(.fork == false) | .full_name') \
             || echo "Error fetching repositories"
 
-          # Prepare directories
-          mkdir -p public-repos output
-          cd public-repos
-
-          # Clone each default branch and run per-repo cloc
+          # Clone each default branch and dump per-repo stats
           for REPO in $REPOS; do
             AUTH_URL="https://${GH_PAT}@github.com/$REPO.git"
             DEFAULT_BRANCH=$(curl -H "Authorization: token $GH_PAT" \
               -s "https://api.github.com/repos/$REPO" \
               | jq -r '.default_branch')
             CLONE_DIR="$(basename $REPO)-$DEFAULT_BRANCH"
+
             git clone --branch "$DEFAULT_BRANCH" --single-branch \
               "$AUTH_URL" "$CLONE_DIR" || echo "Failed to clone $REPO"
 
-            # Dump lines count for this repo
             cloc "$CLONE_DIR" \
               --exclude-ext=json,html,css,svg,md,py,ps1,scss \
               --json > "../output/cloc-${REPO//\//_}.json"
@@ -65,7 +65,17 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          # --- Build per-repo summary JSON ---
+          # Safe number formatter (treat null/empty as 0)
+          format_number() {
+            export LC_ALL="en_US.UTF-8"
+            if [[ -z "$1" || "$1" == "null" ]]; then
+              printf "0\n"
+            else
+              printf "%'d\n" "$1"
+            fi
+          }
+
+          # Build per-repo summary JSON
           echo "[" > output/repos-summary.json
           first=true
           for F in output/cloc-*.json; do
@@ -76,8 +86,7 @@ jobs:
           done
           echo "]" >> output/repos-summary.json
 
-          # --- Generate Markdown list for per-repo breakdown ---
-          format_number() { export LC_ALL="en_US.UTF-8"; printf "%'d" "$1"; }
+          # Generate Markdown for per-repo breakdown
           REPO_MD=""
           while read -r ROW; do
             R=$(jq -r '.repo' <<<"$ROW")
@@ -94,28 +103,26 @@ jobs:
           }' README.md
           rm temp_repo.md
 
-          # --- Extract global stats ---
+          # Extract and format global stats
           TOTAL=$(jq '.SUM.code // 0' output/cloc-output.json)
-          JS=$(jq '.JavaScript.code     // 0' output/cloc-output.json)
-          TS=$(jq '.TypeScript.code     // 0' output/cloc-output.json)
-          JSX=$(jq '.JSX.code           // 0' output/cloc-output.json)
-          CSHARP=$(jq '."C#".code        // 0' output/cloc-output.json)
+          JS=$(jq '.JavaScript.code // 0' output/cloc-output.json)
+          TS=$(jq '.TypeScript.code // 0' output/cloc-output.json)
+          JSX=$(jq '.JSX.code // 0' output/cloc-output.json)
+          CSHARP=$(jq '."C#".code // 0' output/cloc-output.json)
           VUE=$(jq '."Vuejs Component".code // 0' output/cloc-output.json)
-          PHP=$(jq '.PHP.code           // 0' output/cloc-output.json)
+          PHP=$(jq '.PHP.code // 0' output/cloc-output.json)
           OTHER=$((TOTAL - JS - TS - JSX - PHP - CSHARP - VUE))
 
-          format_number() { export LC_ALL="en_US.UTF-8"; printf "%'d\n" "$1"; }
+          F_TOTAL=$(format_number "$TOTAL")
+          F_JS=$(format_number "$JS")
+          F_TS=$(format_number "$TS")
+          F_JSX=$(format_number "$JSX")
+          F_CSHARP=$(format_number "$CSHARP")
+          F_VUE=$(format_number "$VUE")
+          F_PHP=$(format_number "$PHP")
+          F_OTHER=$(format_number "$OTHER")
 
-          F_TOTAL=$(format_number $TOTAL)
-          F_JS=$(format_number $JS)
-          F_TS=$(format_number $TS)
-          F_JSX=$(format_number $JSX)
-          F_CSHARP=$(format_number $CSHARP)
-          F_VUE=$(format_number $VUE)
-          F_PHP=$(format_number $PHP)
-          F_OTHER=$(format_number $OTHER)
-
-          # --- Build global languages block ---
+          # Build global languages block
           CODE_BLOCK="\`\`\`
           [ LANGUAGES BREAKDOWN ]
 
@@ -138,8 +145,7 @@ jobs:
           }' README.md
           rm temp_block.txt
 
-          # Commit & push all JSONs and the updated README
+          # Commit and push
           git add output/*.json README.md
-          git commit -m "chore: update README with global & per-repo code stats" || echo "No changes to commit"
           git pull --rebase origin main || true
           git push origin HEAD
